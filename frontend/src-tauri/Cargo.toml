@@ -1,0 +1,28 @@
+[package]
+name = "forge-terminal-app"
+version = "0.1.0"
+description = "Forge Terminal — desktop terminal emulator"
+authors = ["Conner Schmidt"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "forge_terminal_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.9.5", features = [] }
+tauri-plugin-log = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "sync"] }
+
+dirs = "5"
+
+session-pty-core = { path = "../../backend/crates/session-pty-core" }
+session-pty-router = { path = "../../backend/crates/session-pty-router" }
+session_api = { path = "../../backend/crates/session-api" }

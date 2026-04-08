@@ -1,0 +1,19 @@
+[package]
+name = "session_api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+serde.workspace = true
+session_contracts = { package = "session_contracts", path = "../session-contracts" }
+session-pty-core = { path = "../session-pty-core" }
+session-pty-router = { path = "../session-pty-router" }
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
