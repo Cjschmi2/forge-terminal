@@ -1,10 +1,60 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
   import { ptySend, ptyResize, onPtyOutput, type PtyOutputEvent } from '$lib/tauri';
   import { theme, type ThemeSettings } from '$lib/stores/theme';
   import 'xterm/css/xterm.css';
 
   export let sessionName: string;
+
+  // Room tag pattern: [{tag:payload}]
+  const ROOM_TAG_RE = /\[\{(register|discover|rooms|msg|broadcast|nudge|inbox|cmd|spawn|poll|status|help)(?::[^}]*)?\}\]/g;
+
+  // Buffer for accumulating partial chunks that might split a tag
+  let tagBuffer = '';
+
+  function processChunkForTags(data: Uint8Array): Uint8Array {
+    // Decode to string, prepend any buffered partial
+    const text = tagBuffer + new TextDecoder().decode(data);
+    tagBuffer = '';
+
+    // Check for potential partial tag at the end (starts with [{ but no }])
+    const lastOpen = text.lastIndexOf('[{');
+    const lastClose = text.lastIndexOf('}]');
+    if (lastOpen > lastClose && lastOpen >= 0) {
+      // Partial tag at the end — buffer it for next chunk
+      tagBuffer = text.slice(lastOpen);
+      const before = text.slice(0, lastOpen);
+      return processText(before);
+    }
+
+    return processText(text);
+  }
+
+  function processText(text: string): Uint8Array {
+    // Find all room tags
+    const matches: string[] = [];
+    let match;
+    const re = new RegExp(ROOM_TAG_RE.source, 'g');
+    while ((match = re.exec(text)) !== null) {
+      // Extract the inner part (between [{ and }])
+      const raw = match[0];
+      const inner = raw.slice(2, -2);
+      matches.push(inner);
+    }
+
+    // If tags found, send them to Tauri for processing (fire and forget)
+    if (matches.length > 0) {
+      invoke('process_room_tags', {
+        sessionName: sessionName,
+        tags: matches,
+      }).catch(() => {});
+    }
+
+    // Return the original bytes unmodified — tags stay visible in the agent's output
+    // (the agent wrote them, so they should appear in its terminal)
+    return new TextEncoder().encode(text);
+  }
 
   let terminalEl: HTMLDivElement;
   let term: import('xterm').Terminal | null = null;
@@ -116,10 +166,12 @@
       applyTermTheme(newTheme);
     });
 
-    // PTY output from Rust -> xterm.js
+    // PTY output from Rust -> scan for tags -> xterm.js
     const unlistenFn = await onPtyOutput((event: PtyOutputEvent) => {
       if (event.session_name === sessionName) {
-        term?.write(new Uint8Array(event.data));
+        const raw = new Uint8Array(event.data);
+        const processed = processChunkForTags(raw);
+        term?.write(processed);
       }
     });
     unlisten = unlistenFn;

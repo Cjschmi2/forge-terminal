@@ -952,83 +952,9 @@ async fn room_agents(
 }
 
 // ---------------------------------------------------------------------------
-// Output pump
+// Output pump (clean passthrough — no tag scanning here)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "network")]
-fn spawn_output_pump(
-    app: AppHandle,
-    session_name: String,
-    mut rx: tokio::sync::broadcast::Receiver<OutputChunk>,
-    state: Arc<AppState>,
-) -> tauri::async_runtime::JoinHandle<()> {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(chunk) => {
-                    let raw = chunk.data.to_vec();
-
-                    // Scan for layer 2 room tags in the output
-                    if let Some(ref node) = state.forge_node {
-                        let text = String::from_utf8_lossy(&raw);
-                        let room_tags = forge_room_tags::scan_room_tags(&text);
-
-                        if !room_tags.is_empty() {
-                            // Strip tag patterns from the output before sending to xterm
-                            let mut cleaned = text.to_string();
-                            // Remove tags in reverse order to preserve offsets
-                            for (_, raw_tag, start, end) in room_tags.iter().rev() {
-                                cleaned.replace_range(start..end, "");
-                            }
-
-                            // Send cleaned output to xterm (if anything remains)
-                            let cleaned_bytes = cleaned.as_bytes().to_vec();
-                            if !cleaned_bytes.iter().all(|b| b.is_ascii_whitespace()) {
-                                let _ = app.emit("pty-output", &PtyOutputEvent {
-                                    session_name: session_name.clone(),
-                                    data: cleaned_bytes,
-                                });
-                            }
-
-                            // Handle each room tag
-                            for (tag, _, _, _) in &room_tags {
-                                let response = handle_room_tag(
-                                    node,
-                                    &session_name,
-                                    tag,
-                                    &state,
-                                    &app,
-                                ).await;
-                                if let Some(resp_text) = response {
-                                    let _ = app.emit("pty-output", &PtyOutputEvent {
-                                        session_name: session_name.clone(),
-                                        data: resp_text.into_bytes(),
-                                    });
-                                }
-                            }
-                            continue;
-                        }
-                    }
-
-                    // No room tags — pass through raw
-                    let _ = app.emit(
-                        "pty-output",
-                        &PtyOutputEvent {
-                            session_name: session_name.clone(),
-                            data: raw,
-                        },
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!("output lagged by {n} for {session_name}");
-                }
-            }
-        }
-    })
-}
-
-#[cfg(not(feature = "network"))]
 fn spawn_output_pump(
     app: AppHandle,
     session_name: String,
@@ -1054,6 +980,48 @@ fn spawn_output_pump(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Room tag processing (called by Stop hook via file watcher or Tauri command)
+// ---------------------------------------------------------------------------
+
+/// Tauri command: process room tags from a Claude Code Stop hook.
+/// The hook script extracts [{...}] tags from the assistant_message and
+/// writes them to a tag file. Forge-terminal watches the file and calls
+/// this to process them. Also callable directly from the frontend.
+#[tauri::command]
+async fn process_room_tags(
+    #[allow(unused_variables)]
+    state: State<'_, Arc<AppState>>,
+    #[allow(unused_variables)]
+    app: AppHandle,
+    #[allow(unused_variables)]
+    session_name: String,
+    #[allow(unused_variables)]
+    tags: Vec<String>,
+) -> Result<Vec<String>, String> {
+    #[cfg(feature = "network")]
+    {
+        let s = state.inner().clone();
+        let node = match &s.forge_node {
+            Some(n) => n,
+            None => return Ok(vec![]),
+        };
+
+        let mut responses = Vec::new();
+        for tag_str in &tags {
+            if let Some(tag) = forge_room_tags::parse_room_tag(tag_str) {
+                let resp = handle_room_tag(node, &session_name, &tag, &s, &app).await;
+                if let Some(r) = resp {
+                    responses.push(r);
+                }
+            }
+        }
+        return Ok(responses);
+    }
+    #[cfg(not(feature = "network"))]
+    Ok(vec![])
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1104,7 @@ pub fn run() {
             remote_ls,
             remote_home,
             open_file,
+            process_room_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
