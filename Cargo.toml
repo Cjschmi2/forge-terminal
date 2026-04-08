@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "backend/crates/protocol-wire-core",
-    "backend/crates/protocol-tag-scanner",
     "backend/crates/session-contracts",
     "backend/crates/session-pty-core",
     "backend/crates/session-pty-native",
@@ -33,3 +31,8 @@ thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "rt", "sync"] }
 tracing = "0.1.41"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+
+# From forge-communication (sibling repo)
+protocol-wire-core = { path = "../forge-communication/crates/wire-core" }
+protocol-tag-scanner = { path = "../forge-communication/crates/tag-scanner" }
+forge-node = { path = "../forge-communication/crates/forge-node" }

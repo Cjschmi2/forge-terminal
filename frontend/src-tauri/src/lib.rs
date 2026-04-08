@@ -17,6 +17,8 @@ pub struct AppState {
     pub pty: PtyBridge,
     pub output_pumps: RwLock<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
     pub pty_rt: tokio::runtime::Runtime,
+    #[cfg(feature = "network")]
+    pub forge_node: Option<forge_node::ForgeNode>,
 }
 
 unsafe impl Send for AppState {}
@@ -143,6 +145,26 @@ async fn sessions_launch(
 
     let pump = spawn_output_pump(app, request.name.clone(), rx);
     state.output_pumps.write().await.insert(request.name.clone(), pump);
+
+    // Bridge tag events to NATS when network feature is enabled
+    #[cfg(feature = "network")]
+    if state.forge_node.is_some() {
+        if let Ok(mut tag_rx) = state.pty.subscribe_tags(&request.name) {
+            let s = state.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(ref node) = s.forge_node {
+                    if let Some(nats) = node.try_nats() {
+                        let project_id = &node.config().project_id;
+                        while let Ok(event) = tag_rx.recv().await {
+                            if let Err(e) = nats.broadcast(project_id, &event.frame).await {
+                                log::warn!("NATS tag publish failed: {e}");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     Ok(LaunchResponse { session_id: session_id.to_string(), name: request.name })
 }
@@ -510,10 +532,45 @@ pub fn run() {
         .build()
         .expect("pty runtime");
 
+    // Optionally initialize forge-node for NATS integration
+    #[cfg(feature = "network")]
+    let forge_node = {
+        // Check if NATS_URL env var is set — if so, start the network layer
+        match std::env::var("NATS_URL") {
+            Ok(nats_url) => {
+                let config = forge_node::ForgeNodeConfig {
+                    node_name: "forge-terminal".into(),
+                    project_id: std::env::var("FORGE_PROJECT_ID")
+                        .unwrap_or_else(|_| "default".into()),
+                    machine_id: None,
+                    nats: Some(forge_node::NatsConfig {
+                        server_url: nats_url.clone(),
+                        auth_token: None,
+                        jetstream_max_age_secs: 86400,
+                        jetstream_max_messages: 100_000,
+                    }),
+                };
+                match pty_rt.block_on(forge_node::ForgeNode::builder(config).build()) {
+                    Ok(node) => {
+                        log::info!("forge-node connected to NATS at {nats_url}");
+                        Some(node)
+                    }
+                    Err(e) => {
+                        log::warn!("forge-node init failed: {e} — running without network");
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        }
+    };
+
     let state = Arc::new(AppState {
         pty: PtyBridge::with_defaults(),
         output_pumps: RwLock::new(HashMap::new()),
         pty_rt,
+        #[cfg(feature = "network")]
+        forge_node,
     });
 
     tauri::Builder::default()

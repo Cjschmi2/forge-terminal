@@ -26,3 +26,10 @@ dirs = "5"
 session-pty-core = { path = "../../backend/crates/session-pty-core" }
 session-pty-router = { path = "../../backend/crates/session-pty-router" }
 session_api = { path = "../../backend/crates/session-api" }
+
+# Network integration (optional)
+forge-node = { workspace = true, features = ["nats"], optional = true }
+
+[features]
+default = []
+network = ["dep:forge-node"]
