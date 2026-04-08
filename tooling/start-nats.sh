@@ -23,14 +23,16 @@ echo "Starting NATS + JetStream..."
 docker compose -f "$COMM_ROOT/deploy/docker-compose.yml" up -d
 
 echo ""
-echo "Waiting for health check..."
+echo "Waiting for NATS to accept connections..."
 for i in $(seq 1 15); do
-    if curl -sf http://localhost:8222/healthz > /dev/null 2>&1; then
-        echo "NATS is healthy: nats://127.0.0.1:4222"
-        echo "Monitoring: http://localhost:8222"
+    # NATS client port responds with its protocol info on raw TCP connect
+    if timeout 1 bash -c 'echo "" > /dev/tcp/127.0.0.1/4222' 2>/dev/null; then
+        echo "NATS is ready: nats://127.0.0.1:4222"
+        echo "Monitoring:    http://localhost:8222"
         exit 0
     fi
     sleep 1
 done
 
-echo "WARNING: NATS started but health check timed out. It may still be initializing."
+echo "WARNING: NATS started but port 4222 not responding after 15s."
+echo "Check: docker logs deploy-nats-1"
