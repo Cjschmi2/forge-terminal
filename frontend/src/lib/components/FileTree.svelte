@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { fsList, remoteLs, openFile, type FileEntry, type FsListResponse } from '$lib/tauri';
+  import FileIcon from '$lib/components/FileIcon.svelte';
 
   export let initialPath: string = '/home';
   export let machineId: string = 'local';
@@ -154,6 +155,7 @@
         {:else}
           <span class="arrow-spacer"></span>
         {/if}
+        <span class="icon"><FileIcon name={node.entry.name} isDir={node.entry.is_dir} size={15} /></span>
         <span class="name">{node.entry.name}</span>
         {#if !node.entry.is_dir}
           <span class="size">{formatSize(node.entry.size)}</span>
@@ -250,6 +252,7 @@
 
   .arrow { width: 10px; font-size: 8px; color: rgba(255,255,255,0.5); flex-shrink: 0; text-align: center; }
   .arrow-spacer { width: 10px; flex-shrink: 0; }
+  .icon { width: 16px; flex-shrink: 0; display: flex; align-items: center; }
   .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .size { font-size: 9px; color: rgba(255,255,255,0.45); flex-shrink: 0; font-family: var(--tree-font); }
 

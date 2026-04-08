@@ -288,7 +288,6 @@
               {#if namingTab === i}
                 <h2 class="naming-title">Name this agent</h2>
                 <div class="naming-row">
-                  <span class="naming-at">@</span>
                   <input
                     class="naming-input"
                     type="text"
@@ -631,12 +630,6 @@
     display: flex;
     align-items: center;
     gap: 4px;
-  }
-  .naming-at {
-    font-family: var(--font-mono);
-    font-size: 18px;
-    color: var(--accent);
-    font-weight: 600;
   }
   .naming-input {
     background: rgba(255,255,255,0.03);
