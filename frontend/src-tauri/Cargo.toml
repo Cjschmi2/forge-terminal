@@ -31,5 +31,5 @@ session_api = { path = "../../backend/crates/session-api" }
 forge-node = { workspace = true, features = ["nats"], optional = true }
 
 [features]
-default = []
+default = ["network"]
 network = ["dep:forge-node"]
