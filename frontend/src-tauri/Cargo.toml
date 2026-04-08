@@ -21,6 +21,7 @@ tauri = { version = "2.9.5", features = [] }
 tauri-plugin-log = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "sync"] }
 
+chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 
 session-pty-core = { path = "../../backend/crates/session-pty-core" }
@@ -28,8 +29,9 @@ session-pty-router = { path = "../../backend/crates/session-pty-router" }
 session_api = { path = "../../backend/crates/session-api" }
 
 # Network integration (optional)
-forge-node = { workspace = true, features = ["nats"], optional = true }
+forge-node = { workspace = true, features = ["nats", "rooms"], optional = true }
+forge-room-tags = { workspace = true, optional = true }
 
 [features]
 default = ["network"]
-network = ["dep:forge-node"]
+network = ["dep:forge-node", "dep:forge-room-tags"]

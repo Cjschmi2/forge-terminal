@@ -1106,6 +1106,9 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 name = "forge-node"
 version = "0.1.0"
 dependencies = [
+ "forge-room-tags",
+ "forge-rooms",
+ "forge-store",
  "network-discovery",
  "protocol-nats-bridge",
  "protocol-tag-scanner",
@@ -1119,11 +1122,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-room-tags"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "forge-rooms"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "forge-room-tags",
+ "parking_lot",
+ "protocol-nats-bridge",
+ "protocol-wire-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "forge-store"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "chrono",
+ "forge-rooms",
+ "protocol-nats-bridge",
+ "protocol-wire-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "forge-terminal-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs 5.0.1",
  "forge-node",
+ "forge-room-tags",
  "log",
  "serde",
  "serde_json",

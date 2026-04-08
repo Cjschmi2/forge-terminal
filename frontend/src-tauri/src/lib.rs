@@ -143,21 +143,47 @@ async fn sessions_launch(
 
     let rx = state.pty.subscribe(&request.name).map_err(|e| format!("{e}"))?;
 
-    let pump = spawn_output_pump(app, request.name.clone(), rx);
+    let pump = spawn_output_pump(app.clone(), request.name.clone(), rx);
     state.output_pumps.write().await.insert(request.name.clone(), pump);
 
-    // Bridge tag events to NATS when network feature is enabled
+    // Bridge tag events to NATS + handle room tags when network is enabled
     #[cfg(feature = "network")]
     if state.forge_node.is_some() {
         if let Ok(mut tag_rx) = state.pty.subscribe_tags(&request.name) {
             let s = state.inner().clone();
+            let session_name = request.name.clone();
+            let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 if let Some(ref node) = s.forge_node {
-                    if let Some(nats) = node.try_nats() {
-                        let project_id = &node.config().project_id;
-                        while let Ok(event) = tag_rx.recv().await {
-                            if let Err(e) = nats.broadcast(project_id, &event.frame).await {
-                                log::warn!("NATS tag publish failed: {e}");
+                    while let Ok(event) = tag_rx.recv().await {
+                        // Check if this is a layer 2 room tag
+                        let inner = &event.tag.payload;
+                        if let Some(room_tag) = forge_room_tags::parse_room_tag(inner) {
+                            // Handle the room tag
+                            let response = handle_room_tag(
+                                node,
+                                &session_name,
+                                &room_tag,
+                                &s,
+                                &app_handle,
+                            ).await;
+                            // Inject response into the terminal
+                            if let Some(response_text) = response {
+                                let _ = app_handle.emit(
+                                    "pty-output",
+                                    &PtyOutputEvent {
+                                        session_name: session_name.clone(),
+                                        data: response_text.into_bytes(),
+                                    },
+                                );
+                            }
+                        } else {
+                            // Layer 1 tag — forward to NATS
+                            if let Some(nats) = node.try_nats() {
+                                let project_id = &node.config().project_id;
+                                if let Err(e) = nats.broadcast(project_id, &event.frame).await {
+                                    log::warn!("NATS tag publish failed: {e}");
+                                }
                             }
                         }
                     }
@@ -488,6 +514,328 @@ async fn open_file(path: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to open file: {e}"))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Room tag handler
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "network")]
+async fn handle_room_tag(
+    node: &forge_node::ForgeNode,
+    session_name: &str,
+    tag: &forge_room_tags::RoomTag,
+    state: &Arc<AppState>,
+    app: &AppHandle,
+) -> Option<String> {
+    use forge_room_tags::*;
+
+    let rooms = node.try_rooms()?;
+
+    match tag {
+        RoomTag::Register { name } => {
+            let workdir = state.pty.list_sessions().iter()
+                .find(|s| s.name == session_name)
+                .map(|s| s.working_dir.display().to_string())
+                .unwrap_or_else(|| "/tmp".to_string());
+
+            let agent = forge_node::rooms::AgentIdentity::new(
+                name,
+                "claude",
+                &workdir,
+                node.machine_id(),
+                session_name,
+            );
+            match rooms.register(agent) {
+                Ok(()) => {
+                    let resp = TagResponse::Registered { name: name.clone(), room: workdir };
+                    Some(format_response(tag, &resp))
+                }
+                Err(e) => {
+                    Some(format_response(tag, &TagResponse::Error { message: e.to_string() }))
+                }
+            }
+        }
+
+        RoomTag::Discover { target } => {
+            // Find the agent name for this session
+            let agent_name = find_agent_name(rooms, session_name)?;
+            match target.as_deref() {
+                None => {
+                    match rooms.discover(&agent_name) {
+                        Ok(room_list) => {
+                            let data: Vec<(String, Vec<AgentInfo>)> = room_list.iter().map(|(path, agents)| {
+                                let infos = agents.iter().map(|a| AgentInfo {
+                                    name: a.name.clone(),
+                                    tool: a.tool.clone(),
+                                    room: a.root_room.clone(),
+                                    status: a.status.to_string(),
+                                    last_active: a.last_heartbeat.format("%H:%M:%S").to_string(),
+                                }).collect();
+                                (path.clone(), infos)
+                            }).collect();
+                            Some(format_response(tag, &TagResponse::DiscoverAll { rooms: data }))
+                        }
+                        Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                    }
+                }
+                Some(t) if t.starts_with('@') => {
+                    let name = t.trim_start_matches('@');
+                    match rooms.get_agent(name) {
+                        Some(a) => {
+                            let info = AgentInfo {
+                                name: a.name.clone(), tool: a.tool.clone(),
+                                room: a.root_room.clone(), status: a.status.to_string(),
+                                last_active: a.last_heartbeat.format("%H:%M:%S").to_string(),
+                            };
+                            Some(format_response(tag, &TagResponse::DiscoverAgent { agent: info }))
+                        }
+                        None => Some(format_response(tag, &TagResponse::Error { message: format!("agent not found: @{name}") })),
+                    }
+                }
+                _ => {
+                    // discover:room — list agents in root room only
+                    let agent_name = find_agent_name(rooms, session_name)?;
+                    match rooms.discover(&agent_name) {
+                        Ok(room_list) => {
+                            let data: Vec<(String, Vec<AgentInfo>)> = room_list.into_iter().take(1).map(|(path, agents)| {
+                                let infos = agents.iter().map(|a| AgentInfo {
+                                    name: a.name.clone(), tool: a.tool.clone(),
+                                    room: a.root_room.clone(), status: a.status.to_string(),
+                                    last_active: a.last_heartbeat.format("%H:%M:%S").to_string(),
+                                }).collect();
+                                (path, infos)
+                            }).collect();
+                            Some(format_response(tag, &TagResponse::DiscoverAll { rooms: data }))
+                        }
+                        Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                    }
+                }
+            }
+        }
+
+        RoomTag::Rooms { tree } => {
+            let agent_name = find_agent_name(rooms, session_name)?;
+            if *tree {
+                match rooms.visible_rooms(&agent_name) {
+                    Ok(visible) => {
+                        let data = visible.iter().map(|(p, c)| RoomInfo { path: p.clone(), agent_count: *c }).collect();
+                        Some(format_response(tag, &TagResponse::RoomsList { rooms: data }))
+                    }
+                    Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                }
+            } else {
+                match rooms.agent_rooms(&agent_name) {
+                    Ok(paths) => {
+                        let data = paths.iter().map(|p| RoomInfo { path: p.clone(), agent_count: 0 }).collect();
+                        Some(format_response(tag, &TagResponse::RoomsList { rooms: data }))
+                    }
+                    Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                }
+            }
+        }
+
+        RoomTag::Msg { target, text } => {
+            let sender = find_agent_name(rooms, session_name)?;
+            // Find target's session and inject message
+            if let Some(target_agent) = rooms.get_agent(target) {
+                let msg_text = forge_room_tags::format_inbound_message(&sender, text);
+                let _ = app.emit("pty-output", &PtyOutputEvent {
+                    session_name: target_agent.session_name.clone(),
+                    data: msg_text.into_bytes(),
+                });
+                // Record in room buffer
+                let _ = rooms.record_message(
+                    &sender, &target_agent.root_room,
+                    forge_node::rooms::room::RoomMessageType::Message,
+                    forge_node::rooms::room::MessageTarget::Agent(target.clone()),
+                    text,
+                );
+                Some(format_response(tag, &TagResponse::MessageSent { target: target.clone() }))
+            } else {
+                Some(format_response(tag, &TagResponse::Error { message: format!("agent not found: @{target}") }))
+            }
+        }
+
+        RoomTag::Broadcast { room: target_room, text } => {
+            let sender = find_agent_name(rooms, session_name)?;
+            let room_path = target_room.clone().unwrap_or_else(|| {
+                rooms.agent_rooms(&sender).ok().and_then(|r| r.first().cloned()).unwrap_or_default()
+            });
+            // Send to all agents in the room
+            let msg_text = forge_room_tags::format_inbound_broadcast(&sender, &room_path, text);
+            if let Ok(discovered) = rooms.discover(&sender) {
+                let mut count = 0;
+                for (path, agents) in &discovered {
+                    if *path == room_path {
+                        for agent in agents {
+                            if agent.name != sender {
+                                let _ = app.emit("pty-output", &PtyOutputEvent {
+                                    session_name: agent.session_name.clone(),
+                                    data: msg_text.clone().into_bytes(),
+                                });
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                let _ = rooms.record_message(
+                    &sender, &room_path,
+                    forge_node::rooms::room::RoomMessageType::Broadcast,
+                    forge_node::rooms::room::MessageTarget::Broadcast,
+                    text,
+                );
+                Some(format_response(tag, &TagResponse::BroadcastSent { room: room_path, count }))
+            } else {
+                Some(format_response(tag, &TagResponse::Error { message: "not registered".into() }))
+            }
+        }
+
+        RoomTag::Nudge { target, text } => {
+            let sender = find_agent_name(rooms, session_name)?;
+            rooms.push_nudge(target, forge_node::rooms::manager::Nudge {
+                sender: sender.clone(),
+                text: text.clone(),
+                timestamp: chrono::Utc::now(),
+            });
+            // Send notification to target
+            if let Some(agent) = rooms.get_agent(target) {
+                let notif = forge_room_tags::format_nudge_notification(&sender);
+                let _ = app.emit("pty-output", &PtyOutputEvent {
+                    session_name: agent.session_name.clone(),
+                    data: notif.into_bytes(),
+                });
+            }
+            Some(format_response(tag, &TagResponse::NudgeSent { target: target.clone() }))
+        }
+
+        RoomTag::Inbox { clear } => {
+            let agent_name = find_agent_name(rooms, session_name)?;
+            if *clear {
+                let nudges = rooms.drain_nudges(&agent_name);
+                Some(format_response(tag, &TagResponse::InboxCleared { count: nudges.len() }))
+            } else {
+                let nudges = rooms.drain_nudges(&agent_name);
+                let displays: Vec<NudgeDisplay> = nudges.iter().map(|n| NudgeDisplay {
+                    sender: n.sender.clone(),
+                    timestamp: n.timestamp.format("%H:%M:%S").to_string(),
+                    text: n.text.clone(),
+                }).collect();
+                Some(format_response(tag, &TagResponse::InboxContents { nudges: displays }))
+            }
+        }
+
+        RoomTag::Poll { target: forge_room_tags::PollTarget::Room { path, limit } } => {
+            let agent_name = find_agent_name(rooms, session_name)?;
+            let room_path = path.clone().unwrap_or_else(|| {
+                rooms.agent_rooms(&agent_name).ok().and_then(|r| r.first().cloned()).unwrap_or_default()
+            });
+            match rooms.poll_room(&room_path, *limit) {
+                Ok(msgs) => {
+                    let displays: Vec<RoomMessageDisplay> = msgs.iter().map(|m| RoomMessageDisplay {
+                        sender: m.sender.clone(),
+                        timestamp: m.timestamp.format("%H:%M:%S").to_string(),
+                        message_type: m.message_type.to_string(),
+                        target: match &m.target {
+                            forge_node::rooms::room::MessageTarget::Agent(n) => Some(format!("@{n}")),
+                            forge_node::rooms::room::MessageTarget::Room(r) => Some(r.clone()),
+                            forge_node::rooms::room::MessageTarget::Broadcast => None,
+                        },
+                        text: m.payload.clone(),
+                    }).collect();
+                    Some(format_response(tag, &TagResponse::PollResult {
+                        header: format!("Room: {} (last {})", room_path, limit),
+                        messages: displays,
+                    }))
+                }
+                Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+            }
+        }
+
+        RoomTag::Poll { target: forge_room_tags::PollTarget::Names { path } } => {
+            let agent_name = find_agent_name(rooms, session_name)?;
+            let names = rooms.all_names(&agent_name).unwrap_or_default();
+            Some(format_response(tag, &TagResponse::NamesList { names, room: path.clone() }))
+        }
+
+        RoomTag::Status { text } => {
+            let sender = find_agent_name(rooms, session_name)?;
+            let room_path = rooms.agent_rooms(&sender).ok().and_then(|r| r.first().cloned()).unwrap_or_default();
+            let _ = rooms.record_message(
+                &sender, &room_path,
+                forge_node::rooms::room::RoomMessageType::Status,
+                forge_node::rooms::room::MessageTarget::Broadcast,
+                text,
+            );
+            Some(format_response(tag, &TagResponse::StatusEmitted { text: text.clone() }))
+        }
+
+        RoomTag::Help => {
+            Some(format_response(tag, &TagResponse::Help { text: forge_room_tags::help_text() }))
+        }
+
+        // cmd, spawn, poll:agent — these need more wiring (task #22)
+        _ => {
+            Some(format_response(tag, &TagResponse::Error { message: "tag not yet implemented".into() }))
+        }
+    }
+}
+
+#[cfg(feature = "network")]
+fn find_agent_name(rooms: &forge_node::rooms::RoomManager, session_name: &str) -> Option<String> {
+    // Search all rooms for an agent with this session name
+    // This is a linear scan — fine for <100 agents
+    for (_, agents) in rooms.discover("__probe__").unwrap_or_default() {
+        for agent in agents {
+            if agent.session_name == session_name {
+                return Some(agent.name.clone());
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Room Tauri commands
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "network")]
+#[derive(Debug, Serialize)]
+struct RoomListEntry {
+    path: String,
+    agent_count: usize,
+}
+
+#[cfg(feature = "network")]
+#[derive(Debug, Serialize)]
+struct RoomAgentEntry {
+    name: String,
+    tool: String,
+    room: String,
+    status: String,
+    session_name: String,
+}
+
+#[cfg(feature = "network")]
+#[tauri::command]
+async fn rooms_list(state: State<'_, Arc<AppState>>) -> Result<Vec<RoomListEntry>, String> {
+    let node = state.forge_node.as_ref().ok_or("network not enabled")?;
+    let rooms = node.try_rooms().ok_or("rooms not enabled")?;
+    // List all rooms that have agents — scan by using a dummy discover
+    // In practice the UI would need a dedicated method, but this works for now
+    Ok(vec![]) // TODO: implement once we have a list_all_rooms method
+}
+
+#[cfg(feature = "network")]
+#[tauri::command]
+async fn room_agents(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+) -> Result<Vec<RoomAgentEntry>, String> {
+    let node = state.forge_node.as_ref().ok_or("network not enabled")?;
+    let rooms = node.try_rooms().ok_or("rooms not enabled")?;
+    // Get agents in this specific room path
+    Ok(vec![]) // TODO: expose room-level query
 }
 
 // ---------------------------------------------------------------------------

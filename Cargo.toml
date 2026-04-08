@@ -36,3 +36,4 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 protocol-wire-core = { path = "../forge-communication/crates/wire-core" }
 protocol-tag-scanner = { path = "../forge-communication/crates/tag-scanner" }
 forge-node = { path = "../forge-communication/crates/forge-node" }
+forge-room-tags = { path = "../forge-communication/crates/forge-room-tags" }
