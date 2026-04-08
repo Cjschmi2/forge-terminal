@@ -5,7 +5,7 @@
   import MachineConfig from '$lib/components/MachineConfig.svelte';
   import Settings from '$lib/components/Settings.svelte';
   import { initTheme } from '$lib/stores/theme';
-  import { launchSession, ptyKill, getHomeDir, machinesList, remoteHome, type MachineConfig as MachineType } from '$lib/tauri';
+  import { launchSession, ptyKill, ptySend, getHomeDir, machinesList, remoteHome, type MachineConfig as MachineType } from '$lib/tauri';
 
   interface Tab {
     name: string;
@@ -15,6 +15,7 @@
     machine: string;
     machineName: string;
     treeRoot: string;
+    agentName: string;
     state: 'launcher' | 'terminal';
   }
 
@@ -32,6 +33,7 @@
   let windowWidth = 1400;
   let userHidTree = false;
   let isDragging = false;
+  let sidebarMode: 'files' | 'rooms' = 'files';
 
   const tools = [
     { id: 'claude', label: 'Claude' },
@@ -60,6 +62,7 @@
       machine: 'local',
       machineName: 'Local',
       treeRoot: homeDir,
+      agentName: '',
       state: 'launcher',
     };
     tabs = [...tabs, tab];
@@ -79,6 +82,7 @@
       machine: m.id,
       machineName: m.name,
       treeRoot: root,
+      agentName: '',
       state: 'launcher',
     };
     tabs = [...tabs, tab];
@@ -90,6 +94,7 @@
     const name = `${toolId}-${Date.now()}`;
     const dirName = tab.workingDir.split('/').pop() || 'home';
     const machineLabel = tab.machine === 'local' ? '' : ` @${tab.machineName}`;
+    const agentLabel = tab.agentName ? ` @${tab.agentName}` : '';
 
     try {
       await launchSession({
@@ -98,10 +103,19 @@
         working_directory: tab.workingDir,
         machine: tab.machine,
       });
+
+      // If agent name was provided, inject the register tag after a brief delay
+      // to let the session initialize
+      if (tab.agentName) {
+        setTimeout(() => {
+          ptySend(name, `[{register:@${tab.agentName}}]\n`).catch(() => {});
+        }, 1500);
+      }
+
       tabs[tabIdx] = {
         ...tab,
         name,
-        displayName: `${toolId} (${dirName})${machineLabel}`,
+        displayName: tab.agentName ? `@${tab.agentName} (${dirName})` : `${toolId} (${dirName})${machineLabel}`,
         tool: toolId,
         state: 'terminal',
       };
@@ -232,7 +246,8 @@
 
     <div class="tab-actions">
       <button class="tab-btn" on:click={() => showSettings = true}>Settings</button>
-      <button class="tab-btn" on:click={toggleTree}>Files</button>
+      <button class="tab-btn" class:active-mode={showTree && sidebarMode === 'files'} on:click={() => { sidebarMode = 'files'; if (!showTree) { showTree = true; userHidTree = false; } else if (sidebarMode === 'files') toggleTree(); }}>Files</button>
+      <button class="tab-btn" class:active-mode={showTree && sidebarMode === 'rooms'} on:click={() => { sidebarMode = 'rooms'; if (!showTree) { showTree = true; userHidTree = false; } else if (sidebarMode === 'rooms') toggleTree(); }}>Rooms</button>
     </div>
   </div>
 
@@ -244,6 +259,16 @@
           {#if tab.state === 'launcher'}
             <div class="launcher">
               <h1>Forge Terminal</h1>
+              <div class="agent-name-row">
+                <span class="agent-name-label">@</span>
+                <input
+                  class="agent-name-input"
+                  type="text"
+                  placeholder="agent name (optional)"
+                  bind:value={tab.agentName}
+                  on:keydown={(e) => { if (e.key === 'Enter' && tab.agentName) launch('claude', i); }}
+                />
+              </div>
               <div class="launcher-tools">
                 {#each tools as tool}
                   <button class="tool-pill" on:click={() => launch(tool.id, i)}>
@@ -281,13 +306,25 @@
         }}
       ></div>
       <div class="tree-area" class:dragging={isDragging} style="width: {effectiveTreeWidth}px;">
-        {#key `${currentTab.machine}-${activeTab}`}
-          <FileTree
-            initialPath={currentTab.treeRoot}
-            machineId={currentTab.machine}
-            {onSelectDir}
-          />
-        {/key}
+        {#if sidebarMode === 'files'}
+          {#key `${currentTab.machine}-${activeTab}`}
+            <FileTree
+              initialPath={currentTab.treeRoot}
+              machineId={currentTab.machine}
+              {onSelectDir}
+            />
+          {/key}
+        {:else}
+          <div class="rooms-panel">
+            <div class="rooms-header">
+              <span class="rooms-title">Rooms</span>
+            </div>
+            <div class="rooms-empty">
+              <p>Room view shows active agent rooms when network mode is enabled.</p>
+              <p class="rooms-hint">Agents register with <code>{'[{register:@name}]'}</code></p>
+            </div>
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
@@ -414,6 +451,7 @@
     transition: all 0.12s;
   }
   .tab-btn:hover { background: rgba(255,255,255,0.06); color: var(--text-primary); }
+  .tab-btn.active-mode { color: var(--accent); }
 
   /* ── + dropdown ──────────────────────────────────────────────── */
   .dropdown-wrapper { position: relative; }
@@ -544,6 +582,32 @@
     letter-spacing: -0.02em;
   }
 
+  .agent-name-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .agent-name-label {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .agent-name-input {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--text-primary);
+    width: 220px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .agent-name-input:focus { border-color: var(--accent); }
+  .agent-name-input::placeholder { color: var(--text-muted); }
+
   .launcher-tools { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
 
   .tool-pill {
@@ -563,6 +627,52 @@
     background: rgba(124, 138, 247, 0.08);
     transform: translateY(-1px);
     box-shadow: 0 4px 12px rgba(99, 102, 241, 0.15);
+  }
+
+  /* ── Rooms panel ──────────────────────────────────────────────── */
+  .rooms-panel {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: var(--tree-bg);
+    border-left: 1px solid var(--border);
+    color: var(--text-primary);
+  }
+  .rooms-header {
+    display: flex;
+    align-items: center;
+    padding: 10px 12px 6px;
+    flex-shrink: 0;
+  }
+  .rooms-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .rooms-empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    text-align: center;
+    gap: 8px;
+  }
+  .rooms-empty p {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+  .rooms-hint code {
+    font-family: var(--font-mono);
+    background: rgba(255,255,255,0.04);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 10px;
   }
 
   .launcher-dir { font-size: 11px; color: var(--text-muted); }

@@ -143,47 +143,21 @@ async fn sessions_launch(
 
     let rx = state.pty.subscribe(&request.name).map_err(|e| format!("{e}"))?;
 
-    let pump = spawn_output_pump(app.clone(), request.name.clone(), rx);
+    let pump = spawn_output_pump(app.clone(), request.name.clone(), rx, state.inner().clone());
     state.output_pumps.write().await.insert(request.name.clone(), pump);
 
-    // Bridge tag events to NATS + handle room tags when network is enabled
+    // Bridge layer 1 tag events to NATS (layer 2 tags are handled in the output pump)
     #[cfg(feature = "network")]
     if state.forge_node.is_some() {
         if let Ok(mut tag_rx) = state.pty.subscribe_tags(&request.name) {
             let s = state.inner().clone();
-            let session_name = request.name.clone();
-            let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 if let Some(ref node) = s.forge_node {
-                    while let Ok(event) = tag_rx.recv().await {
-                        // Check if this is a layer 2 room tag
-                        let inner = &event.tag.payload;
-                        if let Some(room_tag) = forge_room_tags::parse_room_tag(inner) {
-                            // Handle the room tag
-                            let response = handle_room_tag(
-                                node,
-                                &session_name,
-                                &room_tag,
-                                &s,
-                                &app_handle,
-                            ).await;
-                            // Inject response into the terminal
-                            if let Some(response_text) = response {
-                                let _ = app_handle.emit(
-                                    "pty-output",
-                                    &PtyOutputEvent {
-                                        session_name: session_name.clone(),
-                                        data: response_text.into_bytes(),
-                                    },
-                                );
-                            }
-                        } else {
-                            // Layer 1 tag — forward to NATS
-                            if let Some(nats) = node.try_nats() {
-                                let project_id = &node.config().project_id;
-                                if let Err(e) = nats.broadcast(project_id, &event.frame).await {
-                                    log::warn!("NATS tag publish failed: {e}");
-                                }
+                    if let Some(nats) = node.try_nats() {
+                        let project_id = &node.config().project_id;
+                        while let Ok(event) = tag_rx.recv().await {
+                            if let Err(e) = nats.broadcast(project_id, &event.frame).await {
+                                log::warn!("NATS tag publish failed: {e}");
                             }
                         }
                     }
@@ -774,9 +748,148 @@ async fn handle_room_tag(
             Some(format_response(tag, &TagResponse::Help { text: forge_room_tags::help_text() }))
         }
 
-        // cmd, spawn, poll:agent — these need more wiring (task #22)
+        RoomTag::Cmd { target, text } => {
+            let sender = find_agent_name(rooms, session_name)?;
+            if let Some(target_agent) = rooms.get_agent(target) {
+                // Validate access
+                if !rooms.can_reach(&sender, target) {
+                    return Some(format_response(tag, &TagResponse::Error {
+                        message: format!("cannot reach @{target} — not in a shared room"),
+                    }));
+                }
+                // Inject exact bytes into target's PTY stdin
+                let target_session = target_agent.session_name.clone();
+                let cmd_bytes = format!("{}\n", text);
+                let s2 = state.clone();
+                tokio::spawn(async move {
+                    let _ = s2.pty_rt.block_on(
+                        s2.pty.send(&target_session, cmd_bytes.as_bytes())
+                    );
+                });
+                // Record in room buffer
+                let _ = rooms.record_message(
+                    &sender, &target_agent.root_room,
+                    forge_node::rooms::room::RoomMessageType::Command,
+                    forge_node::rooms::room::MessageTarget::Agent(target.clone()),
+                    text,
+                );
+                Some(format_response(tag, &TagResponse::CommandSent { target: target.clone() }))
+            } else {
+                Some(format_response(tag, &TagResponse::Error {
+                    message: format!("agent not found: @{target}"),
+                }))
+            }
+        }
+
+        RoomTag::Spawn { target: spawn_target } => {
+            let sender = find_agent_name(rooms, session_name)?;
+            let sender_root = rooms.agent_rooms(&sender).ok()
+                .and_then(|r| r.first().cloned())
+                .unwrap_or_default();
+
+            // Validate: can only spawn at/below sender's root room
+            if !forge_node::rooms::subjects::is_at_or_below(&sender_root, &spawn_target.path) {
+                return Some(format_response(tag, &TagResponse::Error {
+                    message: format!("cannot spawn above root room: {} is not below {}", spawn_target.path, sender_root),
+                }));
+            }
+
+            let spawn_name = format!("{}-{}", spawn_target.tool, chrono::Utc::now().timestamp_millis());
+            let tool = spawn_target.tool.clone();
+            let tool2 = tool.clone();
+            let path = spawn_target.path.clone();
+            let agent_name = spawn_target.name.clone();
+            let machine = spawn_target.machine.clone();
+
+            // Launch the session via the PtyBridge
+            let s2 = state.clone();
+            let launch_result = tokio::task::spawn_blocking(move || {
+                let is_remote = machine.is_some();
+                let (cmd, work_dir) = if let Some(ref mach) = machine {
+                    let machines = load_machines();
+                    let ssh_base = machines.iter()
+                        .find(|m| m.id == *mach || m.name == *mach)
+                        .map(|m| build_ssh_command(m))
+                        .unwrap_or_else(|| format!("ssh -t {mach}"));
+                    let remote_tool = match tool.as_str() {
+                        "bash" => "bash -l".to_string(),
+                        other => other.to_string(),
+                    };
+                    let ssh_cmd = format!("{} 'cd {} && {}'", ssh_base, path, remote_tool);
+                    (
+                        CommandType::Custom {
+                            command: "bash".to_string(),
+                            args: vec!["-c".to_string(), ssh_cmd],
+                        },
+                        PathBuf::from("/tmp"),
+                    )
+                } else {
+                    (to_command_type(&tool), PathBuf::from(&path))
+                };
+
+                s2.pty_rt.block_on(s2.pty.launch(PtyLaunchRequest {
+                    name: spawn_name.clone(),
+                    command_type: cmd,
+                    working_dir: work_dir,
+                    project_id: if is_remote { "remote".into() } else { "local".into() },
+                    requested_by: "agent".into(),
+                }))
+                .map(|id| (spawn_name, id))
+                .map_err(|e| format!("{e}"))
+            }).await.map_err(|e| format!("{e}"));
+
+            match launch_result {
+                Ok(Ok((spawn_session_name, _session_id))) => {
+                    // Start output pump for the new session
+                    if let Ok(rx) = state.pty.subscribe(&spawn_session_name) {
+                        let pump = spawn_output_pump(
+                            app.clone(), spawn_session_name.clone(), rx, state.clone(),
+                        );
+                        state.output_pumps.write().await
+                            .insert(spawn_session_name.clone(), pump);
+                    }
+
+                    // Register the spawned agent
+                    let agent = forge_node::rooms::AgentIdentity::new(
+                        &agent_name, &tool2, &spawn_target.path,
+                        node.machine_id(), &spawn_session_name,
+                    );
+                    let _ = rooms.register(agent);
+
+                    // Auto-join sender to spawned agent's room
+                    let _ = rooms.join_room(&sender, &spawn_target.path);
+
+                    // Emit Tauri event so frontend can create a tab
+                    let _ = app.emit("session-spawned", &serde_json::json!({
+                        "session_name": spawn_session_name,
+                        "agent_name": agent_name,
+                        "tool": spawn_target.tool,
+                        "path": spawn_target.path,
+                    }));
+
+                    Some(format_response(tag, &TagResponse::Spawned {
+                        name: agent_name, tool: spawn_target.tool.clone(),
+                        path: spawn_target.path.clone(),
+                    }))
+                }
+                Ok(Err(e)) => {
+                    Some(format_response(tag, &TagResponse::Error { message: e }))
+                }
+                Err(e) => {
+                    Some(format_response(tag, &TagResponse::Error { message: e.to_string() }))
+                }
+            }
+        }
+
+        RoomTag::Poll { target: forge_room_tags::PollTarget::Agent { name, limit } } => {
+            // Poll agent terminal output — read from mirror buffer
+            Some(format_response(tag, &TagResponse::Error {
+                message: format!("poll:@{name}:{limit} — terminal output polling not yet available"),
+            }))
+        }
+
         _ => {
-            Some(format_response(tag, &TagResponse::Error { message: "tag not yet implemented".into() }))
+            Some(format_response(tag, &TagResponse::Error { message: "unknown tag".into() }))
         }
     }
 }
@@ -842,10 +955,85 @@ async fn room_agents(
 // Output pump
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "network")]
 fn spawn_output_pump(
     app: AppHandle,
     session_name: String,
     mut rx: tokio::sync::broadcast::Receiver<OutputChunk>,
+    state: Arc<AppState>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(chunk) => {
+                    let raw = chunk.data.to_vec();
+
+                    // Scan for layer 2 room tags in the output
+                    if let Some(ref node) = state.forge_node {
+                        let text = String::from_utf8_lossy(&raw);
+                        let room_tags = forge_room_tags::scan_room_tags(&text);
+
+                        if !room_tags.is_empty() {
+                            // Strip tag patterns from the output before sending to xterm
+                            let mut cleaned = text.to_string();
+                            // Remove tags in reverse order to preserve offsets
+                            for (_, raw_tag, start, end) in room_tags.iter().rev() {
+                                cleaned.replace_range(start..end, "");
+                            }
+
+                            // Send cleaned output to xterm (if anything remains)
+                            let cleaned_bytes = cleaned.as_bytes().to_vec();
+                            if !cleaned_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                                let _ = app.emit("pty-output", &PtyOutputEvent {
+                                    session_name: session_name.clone(),
+                                    data: cleaned_bytes,
+                                });
+                            }
+
+                            // Handle each room tag
+                            for (tag, _, _, _) in &room_tags {
+                                let response = handle_room_tag(
+                                    node,
+                                    &session_name,
+                                    tag,
+                                    &state,
+                                    &app,
+                                ).await;
+                                if let Some(resp_text) = response {
+                                    let _ = app.emit("pty-output", &PtyOutputEvent {
+                                        session_name: session_name.clone(),
+                                        data: resp_text.into_bytes(),
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // No room tags — pass through raw
+                    let _ = app.emit(
+                        "pty-output",
+                        &PtyOutputEvent {
+                            session_name: session_name.clone(),
+                            data: raw,
+                        },
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("output lagged by {n} for {session_name}");
+                }
+            }
+        }
+    })
+}
+
+#[cfg(not(feature = "network"))]
+fn spawn_output_pump(
+    app: AppHandle,
+    session_name: String,
+    mut rx: tokio::sync::broadcast::Receiver<OutputChunk>,
+    _state: Arc<AppState>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         loop {
