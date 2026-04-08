@@ -34,6 +34,9 @@
   let userHidTree = false;
   let isDragging = false;
   let sidebarMode: 'files' | 'rooms' = 'files';
+  let namingTab: number | null = null;
+  let namingTool: string = '';
+  let namingValue: string = '';
 
   const tools = [
     { id: 'claude', label: 'Claude' },
@@ -87,6 +90,30 @@
     };
     tabs = [...tabs, tab];
     activeTab = tabs.length - 1;
+  }
+
+  function promptAgentName(toolId: string, tabIdx: number) {
+    namingTab = tabIdx;
+    namingTool = toolId;
+    namingValue = '';
+  }
+
+  function confirmName() {
+    if (namingTab !== null) {
+      const idx = namingTab;
+      const tool = namingTool;
+      tabs[idx].agentName = namingValue.trim();
+      namingTab = null;
+      namingTool = '';
+      namingValue = '';
+      launch(tool, idx);
+    }
+  }
+
+  function cancelName() {
+    namingTab = null;
+    namingTool = '';
+    namingValue = '';
   }
 
   async function launch(toolId: string, tabIdx: number) {
@@ -258,24 +285,35 @@
         <div class="tab-content" class:visible={i === activeTab}>
           {#if tab.state === 'launcher'}
             <div class="launcher">
-              <h1>Forge Terminal</h1>
-              <div class="agent-name-row">
-                <span class="agent-name-label">@</span>
-                <input
-                  class="agent-name-input"
-                  type="text"
-                  placeholder="agent name (optional)"
-                  bind:value={tab.agentName}
-                  on:keydown={(e) => { if (e.key === 'Enter' && tab.agentName) launch('claude', i); }}
-                />
-              </div>
-              <div class="launcher-tools">
-                {#each tools as tool}
-                  <button class="tool-pill" on:click={() => launch(tool.id, i)}>
-                    {tool.label}
+              {#if namingTab === i}
+                <h2 class="naming-title">Name this agent</h2>
+                <div class="naming-row">
+                  <span class="naming-at">@</span>
+                  <input
+                    class="naming-input"
+                    type="text"
+                    placeholder="agent name"
+                    bind:value={namingValue}
+                    on:keydown={(e) => { if (e.key === 'Enter') confirmName(); if (e.key === 'Escape') cancelName(); }}
+                    autofocus
+                  />
+                </div>
+                <div class="naming-actions">
+                  <button class="naming-btn naming-skip" on:click={confirmName}>
+                    {namingValue.trim() ? 'Start' : 'Skip'}
                   </button>
-                {/each}
-              </div>
+                  <button class="naming-btn naming-cancel" on:click={cancelName}>Cancel</button>
+                </div>
+              {:else}
+                <h1>Forge Terminal</h1>
+                <div class="launcher-tools">
+                  {#each tools as tool}
+                    <button class="tool-pill" on:click={() => promptAgentName(tool.id, i)}>
+                      {tool.label}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
             </div>
           {:else}
             <Terminal sessionName={tab.name} />
@@ -582,31 +620,60 @@
     letter-spacing: -0.02em;
   }
 
-  .agent-name-row {
+  .naming-title {
+    font-family: var(--font-mono);
+    font-size: 18px;
+    font-weight: 400;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+  }
+  .naming-row {
     display: flex;
     align-items: center;
     gap: 4px;
   }
-  .agent-name-label {
+  .naming-at {
     font-family: var(--font-mono);
-    font-size: 16px;
+    font-size: 18px;
     color: var(--accent);
     font-weight: 600;
   }
-  .agent-name-input {
+  .naming-input {
     background: rgba(255,255,255,0.03);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 8px 14px;
+    padding: 10px 16px;
     font-family: var(--font-mono);
-    font-size: 14px;
+    font-size: 15px;
     color: var(--text-primary);
-    width: 220px;
+    width: 240px;
     outline: none;
     transition: border-color 0.15s;
   }
-  .agent-name-input:focus { border-color: var(--accent); }
-  .agent-name-input::placeholder { color: var(--text-muted); }
+  .naming-input:focus { border-color: var(--accent); }
+  .naming-input::placeholder { color: var(--text-muted); }
+  .naming-actions {
+    display: flex;
+    gap: 8px;
+  }
+  .naming-btn {
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 0.12s;
+  }
+  .naming-skip {
+    background: var(--accent);
+    color: white;
+  }
+  .naming-skip:hover { opacity: 0.9; }
+  .naming-cancel {
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+  .naming-cancel:hover { color: var(--text-primary); border-color: var(--text-muted); }
 
   .launcher-tools { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
 

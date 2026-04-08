@@ -41,9 +41,8 @@
     <path d="M2 5.5H14V12C14 12.55 13.55 13 13 13H3C2.45 13 2 12.55 2 12V5.5Z" fill={color} fill-opacity="0.7"/>
   </svg>
 {:else}
-  <!-- Clean file icon -->
+  <!-- Minimal file indicator -->
   <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M4 1.5C4 1.22 4.22 1 4.5 1H9.5L12 3.5V14.5C12 14.78 11.78 15 11.5 15H4.5C4.22 15 4 14.78 4 14.5V1.5Z" fill={color} fill-opacity="0.12" stroke={color} stroke-opacity="0.4" stroke-width="0.7"/>
-    <path d="M9.5 1L12 3.5H10C9.72 3.5 9.5 3.28 9.5 3V1Z" fill={color} fill-opacity="0.3"/>
+    <rect x="4" y="2" width="8" height="12" rx="1" fill={color} fill-opacity="0.12" stroke={color} stroke-opacity="0.35" stroke-width="0.7"/>
   </svg>
 {/if}
