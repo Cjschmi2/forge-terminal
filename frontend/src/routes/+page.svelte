@@ -131,13 +131,9 @@
         machine: tab.machine,
       });
 
-      // If agent name was provided, inject the register tag after a brief delay
-      // to let the session initialize
-      if (tab.agentName) {
-        setTimeout(() => {
-          ptySend(name, `[{register:@${tab.agentName}}]\n`).catch(() => {});
-        }, 1500);
-      }
+      // Agent name is NOT auto-registered here — the agent registers itself
+      // by emitting [{register:@name}] in its response, which the frontend
+      // catches and routes to the RoomManager.
 
       tabs[tabIdx] = {
         ...tab,

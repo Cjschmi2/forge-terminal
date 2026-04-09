@@ -50,12 +50,24 @@
       matches.push(inner);
     }
 
-    // If tags found, send them to Tauri for processing
+    // If tags found, send them to Tauri for processing.
+    // Responses come back as plain text strings. We inject them into PTY
+    // stdin after a delay — by the time flushTagBuffer runs, Claude Code
+    // has finished generating (100ms debounce). Add extra delay to ensure
+    // the agent is at the idle prompt before we inject.
     if (matches.length > 0) {
-      invoke('process_room_tags', {
+      invoke<string[]>('process_room_tags', {
         sessionName: sessionName,
         tags: matches,
-      }).catch((e) => console.warn('process_room_tags failed:', e));
+      }).then((responses: string[]) => {
+        if (responses.length > 0) {
+          const combined = responses.join('');
+          // Delay injection to let Claude Code settle at the prompt
+          setTimeout(() => {
+            ptySend(sessionName, combined).catch(() => {});
+          }, 500);
+        }
+      }).catch((e: unknown) => console.warn('process_room_tags failed:', e));
     }
   }
 

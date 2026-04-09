@@ -1014,18 +1014,13 @@ async fn process_room_tags(
             if let Some(tag) = forge_room_tags::parse_room_tag(tag_str) {
                 let resp = handle_room_tag(node, &session_name, &tag, &s, &app).await;
                 if let Some(r) = resp {
-                    // Write response back into the PTY stdin so it appears
-                    // as if typed — the agent sees it naturally in its context
-                    let s2 = s.clone();
-                    let sn = session_name.clone();
-                    let resp_clone = r.clone();
-                    tokio::task::spawn_blocking(move || {
-                        s2.pty_rt.block_on(s2.pty.send(&sn, resp_clone.as_bytes())).ok();
-                    }).await.ok();
                     responses.push(r);
                 }
             }
         }
+        // Responses are returned to the frontend — the frontend handles
+        // injection timing (waits for Claude to finish generating before
+        // writing to PTY stdin).
         return Ok(responses);
     }
     #[cfg(not(feature = "network"))]
