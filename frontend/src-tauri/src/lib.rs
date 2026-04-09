@@ -523,10 +523,10 @@ async fn handle_room_tag(
             match rooms.register(agent) {
                 Ok(()) => {
                     let resp = TagResponse::Registered { name: name.clone(), room: workdir };
-                    Some(format_response(tag, &resp))
+                    Some(format_response_plain(tag, &resp))
                 }
                 Err(e) => {
-                    Some(format_response(tag, &TagResponse::Error { message: e.to_string() }))
+                    Some(format_response_plain(tag, &TagResponse::Error { message: e.to_string() }))
                 }
             }
         }
@@ -548,9 +548,9 @@ async fn handle_room_tag(
                                 }).collect();
                                 (path.clone(), infos)
                             }).collect();
-                            Some(format_response(tag, &TagResponse::DiscoverAll { rooms: data }))
+                            Some(format_response_plain(tag, &TagResponse::DiscoverAll { rooms: data }))
                         }
-                        Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                        Err(e) => Some(format_response_plain(tag, &TagResponse::Error { message: e.to_string() })),
                     }
                 }
                 Some(t) if t.starts_with('@') => {
@@ -562,9 +562,9 @@ async fn handle_room_tag(
                                 room: a.root_room.clone(), status: a.status.to_string(),
                                 last_active: a.last_heartbeat.format("%H:%M:%S").to_string(),
                             };
-                            Some(format_response(tag, &TagResponse::DiscoverAgent { agent: info }))
+                            Some(format_response_plain(tag, &TagResponse::DiscoverAgent { agent: info }))
                         }
-                        None => Some(format_response(tag, &TagResponse::Error { message: format!("agent not found: @{name}") })),
+                        None => Some(format_response_plain(tag, &TagResponse::Error { message: format!("agent not found: @{name}") })),
                     }
                 }
                 _ => {
@@ -580,9 +580,9 @@ async fn handle_room_tag(
                                 }).collect();
                                 (path, infos)
                             }).collect();
-                            Some(format_response(tag, &TagResponse::DiscoverAll { rooms: data }))
+                            Some(format_response_plain(tag, &TagResponse::DiscoverAll { rooms: data }))
                         }
-                        Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                        Err(e) => Some(format_response_plain(tag, &TagResponse::Error { message: e.to_string() })),
                     }
                 }
             }
@@ -594,17 +594,17 @@ async fn handle_room_tag(
                 match rooms.visible_rooms(&agent_name) {
                     Ok(visible) => {
                         let data = visible.iter().map(|(p, c)| RoomInfo { path: p.clone(), agent_count: *c }).collect();
-                        Some(format_response(tag, &TagResponse::RoomsList { rooms: data }))
+                        Some(format_response_plain(tag, &TagResponse::RoomsList { rooms: data }))
                     }
-                    Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                    Err(e) => Some(format_response_plain(tag, &TagResponse::Error { message: e.to_string() })),
                 }
             } else {
                 match rooms.agent_rooms(&agent_name) {
                     Ok(paths) => {
                         let data = paths.iter().map(|p| RoomInfo { path: p.clone(), agent_count: 0 }).collect();
-                        Some(format_response(tag, &TagResponse::RoomsList { rooms: data }))
+                        Some(format_response_plain(tag, &TagResponse::RoomsList { rooms: data }))
                     }
-                    Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                    Err(e) => Some(format_response_plain(tag, &TagResponse::Error { message: e.to_string() })),
                 }
             }
         }
@@ -625,9 +625,9 @@ async fn handle_room_tag(
                     forge_node::rooms::room::MessageTarget::Agent(target.clone()),
                     text,
                 );
-                Some(format_response(tag, &TagResponse::MessageSent { target: target.clone() }))
+                Some(format_response_plain(tag, &TagResponse::MessageSent { target: target.clone() }))
             } else {
-                Some(format_response(tag, &TagResponse::Error { message: format!("agent not found: @{target}") }))
+                Some(format_response_plain(tag, &TagResponse::Error { message: format!("agent not found: @{target}") }))
             }
         }
 
@@ -659,9 +659,9 @@ async fn handle_room_tag(
                     forge_node::rooms::room::MessageTarget::Broadcast,
                     text,
                 );
-                Some(format_response(tag, &TagResponse::BroadcastSent { room: room_path, count }))
+                Some(format_response_plain(tag, &TagResponse::BroadcastSent { room: room_path, count }))
             } else {
-                Some(format_response(tag, &TagResponse::Error { message: "not registered".into() }))
+                Some(format_response_plain(tag, &TagResponse::Error { message: "not registered".into() }))
             }
         }
 
@@ -680,14 +680,14 @@ async fn handle_room_tag(
                     data: notif.into_bytes(),
                 });
             }
-            Some(format_response(tag, &TagResponse::NudgeSent { target: target.clone() }))
+            Some(format_response_plain(tag, &TagResponse::NudgeSent { target: target.clone() }))
         }
 
         RoomTag::Inbox { clear } => {
             let agent_name = find_agent_name(rooms, session_name)?;
             if *clear {
                 let nudges = rooms.drain_nudges(&agent_name);
-                Some(format_response(tag, &TagResponse::InboxCleared { count: nudges.len() }))
+                Some(format_response_plain(tag, &TagResponse::InboxCleared { count: nudges.len() }))
             } else {
                 let nudges = rooms.drain_nudges(&agent_name);
                 let displays: Vec<NudgeDisplay> = nudges.iter().map(|n| NudgeDisplay {
@@ -695,7 +695,7 @@ async fn handle_room_tag(
                     timestamp: n.timestamp.format("%H:%M:%S").to_string(),
                     text: n.text.clone(),
                 }).collect();
-                Some(format_response(tag, &TagResponse::InboxContents { nudges: displays }))
+                Some(format_response_plain(tag, &TagResponse::InboxContents { nudges: displays }))
             }
         }
 
@@ -717,19 +717,19 @@ async fn handle_room_tag(
                         },
                         text: m.payload.clone(),
                     }).collect();
-                    Some(format_response(tag, &TagResponse::PollResult {
+                    Some(format_response_plain(tag, &TagResponse::PollResult {
                         header: format!("Room: {} (last {})", room_path, limit),
                         messages: displays,
                     }))
                 }
-                Err(e) => Some(format_response(tag, &TagResponse::Error { message: e.to_string() })),
+                Err(e) => Some(format_response_plain(tag, &TagResponse::Error { message: e.to_string() })),
             }
         }
 
         RoomTag::Poll { target: forge_room_tags::PollTarget::Names { path } } => {
             let agent_name = find_agent_name(rooms, session_name)?;
             let names = rooms.all_names(&agent_name).unwrap_or_default();
-            Some(format_response(tag, &TagResponse::NamesList { names, room: path.clone() }))
+            Some(format_response_plain(tag, &TagResponse::NamesList { names, room: path.clone() }))
         }
 
         RoomTag::Status { text } => {
@@ -741,11 +741,11 @@ async fn handle_room_tag(
                 forge_node::rooms::room::MessageTarget::Broadcast,
                 text,
             );
-            Some(format_response(tag, &TagResponse::StatusEmitted { text: text.clone() }))
+            Some(format_response_plain(tag, &TagResponse::StatusEmitted { text: text.clone() }))
         }
 
         RoomTag::Help => {
-            Some(format_response(tag, &TagResponse::Help { text: forge_room_tags::help_text() }))
+            Some(format_response_plain(tag, &TagResponse::Help { text: forge_room_tags::help_text() }))
         }
 
         RoomTag::Cmd { target, text } => {
@@ -753,7 +753,7 @@ async fn handle_room_tag(
             if let Some(target_agent) = rooms.get_agent(target) {
                 // Validate access
                 if !rooms.can_reach(&sender, target) {
-                    return Some(format_response(tag, &TagResponse::Error {
+                    return Some(format_response_plain(tag, &TagResponse::Error {
                         message: format!("cannot reach @{target} — not in a shared room"),
                     }));
                 }
@@ -773,9 +773,9 @@ async fn handle_room_tag(
                     forge_node::rooms::room::MessageTarget::Agent(target.clone()),
                     text,
                 );
-                Some(format_response(tag, &TagResponse::CommandSent { target: target.clone() }))
+                Some(format_response_plain(tag, &TagResponse::CommandSent { target: target.clone() }))
             } else {
-                Some(format_response(tag, &TagResponse::Error {
+                Some(format_response_plain(tag, &TagResponse::Error {
                     message: format!("agent not found: @{target}"),
                 }))
             }
@@ -789,7 +789,7 @@ async fn handle_room_tag(
 
             // Validate: can only spawn at/below sender's root room
             if !forge_node::rooms::subjects::is_at_or_below(&sender_root, &spawn_target.path) {
-                return Some(format_response(tag, &TagResponse::Error {
+                return Some(format_response_plain(tag, &TagResponse::Error {
                     message: format!("cannot spawn above root room: {} is not below {}", spawn_target.path, sender_root),
                 }));
             }
@@ -867,29 +867,29 @@ async fn handle_room_tag(
                         "path": spawn_target.path,
                     }));
 
-                    Some(format_response(tag, &TagResponse::Spawned {
+                    Some(format_response_plain(tag, &TagResponse::Spawned {
                         name: agent_name, tool: spawn_target.tool.clone(),
                         path: spawn_target.path.clone(),
                     }))
                 }
                 Ok(Err(e)) => {
-                    Some(format_response(tag, &TagResponse::Error { message: e }))
+                    Some(format_response_plain(tag, &TagResponse::Error { message: e }))
                 }
                 Err(e) => {
-                    Some(format_response(tag, &TagResponse::Error { message: e.to_string() }))
+                    Some(format_response_plain(tag, &TagResponse::Error { message: e.to_string() }))
                 }
             }
         }
 
         RoomTag::Poll { target: forge_room_tags::PollTarget::Agent { name, limit } } => {
             // Poll agent terminal output — read from mirror buffer
-            Some(format_response(tag, &TagResponse::Error {
+            Some(format_response_plain(tag, &TagResponse::Error {
                 message: format!("poll:@{name}:{limit} — terminal output polling not yet available"),
             }))
         }
 
         _ => {
-            Some(format_response(tag, &TagResponse::Error { message: "unknown tag".into() }))
+            Some(format_response_plain(tag, &TagResponse::Error { message: "unknown tag".into() }))
         }
     }
 }
@@ -1014,6 +1014,14 @@ async fn process_room_tags(
             if let Some(tag) = forge_room_tags::parse_room_tag(tag_str) {
                 let resp = handle_room_tag(node, &session_name, &tag, &s, &app).await;
                 if let Some(r) = resp {
+                    // Write response back into the PTY stdin so it appears
+                    // as if typed — the agent sees it naturally in its context
+                    let s2 = s.clone();
+                    let sn = session_name.clone();
+                    let resp_clone = r.clone();
+                    tokio::task::spawn_blocking(move || {
+                        s2.pty_rt.block_on(s2.pty.send(&sn, resp_clone.as_bytes())).ok();
+                    }).await.ok();
                     responses.push(r);
                 }
             }
