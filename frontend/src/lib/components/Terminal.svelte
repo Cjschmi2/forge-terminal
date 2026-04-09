@@ -7,53 +7,56 @@
 
   export let sessionName: string;
 
-  // Room tag pattern: [{tag:payload}]
+  // Room tag keywords
+  const TAG_KEYWORDS = ['register','discover','rooms','msg','broadcast','nudge','inbox','cmd','spawn','poll','status','help'];
+
+  // Strip ANSI escape sequences for clean text matching
+  const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b\[[\?]?[0-9;]*[hlm]/g;
+
+  // Room tag pattern on clean text
   const ROOM_TAG_RE = /\[\{(register|discover|rooms|msg|broadcast|nudge|inbox|cmd|spawn|poll|status|help)(?::[^}]*)?\}\]/g;
 
-  // Buffer for accumulating partial chunks that might split a tag
+  // Buffer for accumulating output to catch tags split across chunks
   let tagBuffer = '';
+  let tagFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
-  function processChunkForTags(data: Uint8Array): Uint8Array {
-    // Decode to string, prepend any buffered partial
-    const text = tagBuffer + new TextDecoder().decode(data);
-    tagBuffer = '';
+  function processChunkForTags(data: Uint8Array): void {
+    const text = new TextDecoder().decode(data);
+    tagBuffer += text;
 
-    // Check for potential partial tag at the end (starts with [{ but no }])
-    const lastOpen = text.lastIndexOf('[{');
-    const lastClose = text.lastIndexOf('}]');
-    if (lastOpen > lastClose && lastOpen >= 0) {
-      // Partial tag at the end — buffer it for next chunk
-      tagBuffer = text.slice(lastOpen);
-      const before = text.slice(0, lastOpen);
-      return processText(before);
-    }
+    // Debounce: wait for more chunks before scanning (Claude Code sends
+    // output in small bursts). Flush after 100ms of silence.
+    if (tagFlushTimer) clearTimeout(tagFlushTimer);
+    tagFlushTimer = setTimeout(flushTagBuffer, 100);
 
-    return processText(text);
+    // Always write to xterm immediately (no delay for display)
+    term?.write(data);
   }
 
-  function processText(text: string): Uint8Array {
-    // Find all room tags
+  function flushTagBuffer() {
+    if (!tagBuffer) return;
+    const text = tagBuffer;
+    tagBuffer = '';
+
+    // Strip ANSI codes to get clean text for tag matching
+    const clean = text.replace(ANSI_RE, '');
+
+    // Find all room tags in the clean text
     const matches: string[] = [];
     let match;
     const re = new RegExp(ROOM_TAG_RE.source, 'g');
-    while ((match = re.exec(text)) !== null) {
-      // Extract the inner part (between [{ and }])
-      const raw = match[0];
-      const inner = raw.slice(2, -2);
+    while ((match = re.exec(clean)) !== null) {
+      const inner = match[0].slice(2, -2);
       matches.push(inner);
     }
 
-    // If tags found, send them to Tauri for processing (fire and forget)
+    // If tags found, send them to Tauri for processing
     if (matches.length > 0) {
       invoke('process_room_tags', {
         sessionName: sessionName,
         tags: matches,
-      }).catch(() => {});
+      }).catch((e) => console.warn('process_room_tags failed:', e));
     }
-
-    // Return the original bytes unmodified — tags stay visible in the agent's output
-    // (the agent wrote them, so they should appear in its terminal)
-    return new TextEncoder().encode(text);
   }
 
   let terminalEl: HTMLDivElement;
@@ -166,12 +169,10 @@
       applyTermTheme(newTheme);
     });
 
-    // PTY output from Rust -> scan for tags -> xterm.js
+    // PTY output from Rust -> xterm.js (immediate) + tag scan (async)
     const unlistenFn = await onPtyOutput((event: PtyOutputEvent) => {
       if (event.session_name === sessionName) {
-        const raw = new Uint8Array(event.data);
-        const processed = processChunkForTags(raw);
-        term?.write(processed);
+        processChunkForTags(new Uint8Array(event.data));
       }
     });
     unlisten = unlistenFn;
@@ -194,6 +195,8 @@
   });
 
   onDestroy(() => {
+    if (tagFlushTimer) clearTimeout(tagFlushTimer);
+    flushTagBuffer();
     themeUnsub?.();
     unlisten?.();
     windowUnsub?.();
