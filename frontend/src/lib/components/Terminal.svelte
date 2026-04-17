@@ -20,7 +20,19 @@
   let tagBuffer = '';
   let tagFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Don't scan for tags during startup. Claude Code's initial output
+  // includes loaded context/previous conversations that may contain
+  // stale tag patterns — scanning those causes spurious registrations.
+  // Enable after a delay to let startup output finish.
+  let tagScanEnabled = false;
+
   function processChunkForTags(data: Uint8Array): void {
+    // Always write to xterm immediately (no delay for display)
+    term?.write(data);
+
+    // Only accumulate for tag scanning after first user input
+    if (!tagScanEnabled) return;
+
     const text = new TextDecoder().decode(data);
     tagBuffer += text;
 
@@ -28,9 +40,6 @@
     // output in small bursts). Flush after 100ms of silence.
     if (tagFlushTimer) clearTimeout(tagFlushTimer);
     tagFlushTimer = setTimeout(flushTagBuffer, 100);
-
-    // Always write to xterm immediately (no delay for display)
-    term?.write(data);
   }
 
   function flushTagBuffer() {
@@ -79,14 +88,51 @@
   let windowUnsub: (() => void) | null = null;
   let themeUnsub: (() => void) | null = null;
 
+  // Track the last reported dimensions so we don't spam the PTY with
+  // redundant resize calls. Also guards against bogus fits during minimize
+  // where terminalEl briefly reports 0x0.
+  let lastCols = 0;
+  let lastRows = 0;
+  let pendingFit = false;
+
   function doFit() {
+    if (pendingFit) return;
+    pendingFit = true;
     requestAnimationFrame(() => {
+      pendingFit = false;
       if (!fitAddon || !term) return;
+      // Guard: skip if the container is collapsed (e.g. during minimize
+      // on Linux Wayland, or an ancestor is display:none mid-transition).
+      const el = terminalEl;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 16 || rect.height < 16) return;
       try {
+        const proposed = fitAddon.proposeDimensions();
+        if (!proposed || proposed.cols < 2 || proposed.rows < 2) return;
+        // Only call fit + PTY resize if dimensions actually changed.
+        if (proposed.cols === lastCols && proposed.rows === lastRows) return;
         fitAddon.fit();
+        lastCols = term.cols;
+        lastRows = term.rows;
         ptyResize(sessionName, term.cols, term.rows).catch(() => {});
       } catch {}
     });
+  }
+
+  // Re-fit on a trailing-edge timer too — Tauri / Wayland window restore
+  // sometimes reports the final layout one tick late.
+  let refitTimer: ReturnType<typeof setTimeout> | null = null;
+  function scheduleDeferredFit() {
+    if (refitTimer) clearTimeout(refitTimer);
+    refitTimer = setTimeout(() => {
+      refitTimer = null;
+      // Force re-fit by resetting cache; the restored window may have the
+      // same dimensions as pre-minimize but the xterm canvas is stale.
+      lastCols = 0;
+      lastRows = 0;
+      doFit();
+    }, 120);
   }
 
   function hexToRgba(hex: string, alpha: number): string {
@@ -169,12 +215,38 @@
     setTimeout(doFit, 50);
     setTimeout(doFit, 200);
 
-    resizeObserver = new ResizeObserver(doFit);
+    resizeObserver = new ResizeObserver(() => {
+      doFit();
+      // Trailing-edge refit in case the final reflow happens after this
+      // observer fires (common on Linux Wayland when restoring windows).
+      scheduleDeferredFit();
+    });
     resizeObserver.observe(terminalEl);
 
-    const onWindowResize = () => doFit();
+    const onWindowResize = () => {
+      doFit();
+      scheduleDeferredFit();
+    };
     window.addEventListener('resize', onWindowResize);
     windowUnsub = () => window.removeEventListener('resize', onWindowResize);
+
+    // Tauri's visibilitychange fires when the window is restored from
+    // minimized state. Force a refit — xterm's canvas can be blank until
+    // explicit fit() after restore on some compositors.
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        scheduleDeferredFit();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    const visibilityUnsub = () => document.removeEventListener('visibilitychange', onVisibility);
+
+    // Chain the visibility cleanup onto windowUnsub so onDestroy covers it.
+    const priorWindowUnsub = windowUnsub;
+    windowUnsub = () => {
+      priorWindowUnsub?.();
+      visibilityUnsub();
+    };
 
     // Subscribe to theme changes — update xterm live
     themeUnsub = theme.subscribe((newTheme) => {
@@ -188,6 +260,9 @@
       }
     });
     unlisten = unlistenFn;
+
+    // Enable tag scanning after startup output settles
+    setTimeout(() => { tagScanEnabled = true; }, 5000);
 
     // Keyboard input -> Rust PTY
     term.onData((data: string) => {
