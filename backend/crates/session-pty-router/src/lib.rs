@@ -381,24 +381,31 @@ impl PtyRouter {
     /// The lock is acquired, the session reference extracted, the write
     /// performed, and metadata updated before the lock is released.
     #[allow(clippy::await_holding_lock)]
-    pub async fn send(
-        &self,
-        name: &str,
-        instruction: &[u8],
-    ) -> RouterResult<usize> {
+    pub async fn send(&self, name: &str, instruction: &[u8]) -> RouterResult<usize> {
         let id = self.resolve_name(name)?;
-        let mut sessions = self.sessions.write();
-        let rt = sessions
-            .get_mut(&id)
-            .ok_or_else(|| RouterError::SessionNameNotFound(name.into()))?;
-        let n = rt
-            .session
-            .write(instruction)
-            .await
-            .map_err(RouterError::Pty)?;
+        // Temporarily remove the RuntimeSession from the map so we can await on
+        // the async PTY write WITHOUT holding a parking_lot write guard across
+        // the await. (Holding a parking_lot guard across await poisons the
+        // future's Send bound, which breaks axum handlers that wrap us.)
+        // Brief race window: concurrent sends to the same name will see
+        // SessionNameNotFound until this write completes. Acceptable for
+        // typical agent loops (single operator per session).
+        let mut rt = {
+            let mut sessions = self.sessions.write();
+            sessions
+                .remove(&id)
+                .ok_or_else(|| RouterError::SessionNameNotFound(name.into()))?
+        };
+        // Map lock is released. Now do the async PTY write.
+        let write_result = rt.session.write(instruction).await;
         rt.last_activity_instant = Instant::now();
         rt.metadata.last_activity = Utc::now();
-        Ok(n)
+        // Re-insert the session regardless of write result.
+        {
+            let mut sessions = self.sessions.write();
+            sessions.insert(id, rt);
+        }
+        write_result.map(|n| n).map_err(RouterError::Pty)
     }
 
     /// Resize the terminal of a named session.
