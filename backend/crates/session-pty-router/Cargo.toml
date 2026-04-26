@@ -8,13 +8,17 @@ authors.workspace = true
 [dependencies]
 session-pty-core = { path = "../session-pty-core" }
 session-pty-native = { path = "../session-pty-native" }
+session_contracts = { path = "../session-contracts" }
+agentos-subjects.workspace = true
 protocol-tag-scanner.workspace = true
 protocol-wire-core.workspace = true
+async-nats.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "fs", "process", "io-util", "rt"] }
 thiserror.workspace = true
 tracing.workspace = true

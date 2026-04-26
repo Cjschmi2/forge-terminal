@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agentos_subjects::{Domain, Subject, SubjectScope};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
@@ -12,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
+use session_contracts::SessionRegistration;
 use session_pty_core::{
-    PtyError, PtySession, SessionId, PtySessionState, SpawnConfig, TerminalSize,
+    PtyError, PtySession, PtySessionState, SessionId, SpawnConfig, TerminalSize,
 };
 use session_pty_native::NativePtySession;
 
@@ -200,6 +202,14 @@ pub struct PtyRouter {
     named_sessions: Arc<RwLock<BTreeMap<String, SessionId>>>,
     /// Maps SessionId -> runtime state.
     sessions: Arc<RwLock<BTreeMap<SessionId, RuntimeSession>>>,
+    /// Optional NATS client for session registration events.
+    nats_client: Option<async_nats::Client>,
+    /// Subject scope (workspace_id, project_id, tenant_id) used to build
+    /// the canonical `agentos.v1.{ws}.{proj}.{tenant}.agents.{session_id}.{register|deregister}`
+    /// subjects when publishing presence events. Read once from
+    /// `AGENT_OS_*` env vars at construction; falls back to a placeholder
+    /// when the router is launched outside `agent-os spawn`.
+    nats_scope: SubjectScope,
 }
 
 impl PtyRouter {
@@ -209,12 +219,39 @@ impl PtyRouter {
             config,
             named_sessions: Arc::new(RwLock::new(BTreeMap::new())),
             sessions: Arc::new(RwLock::new(BTreeMap::new())),
+            nats_client: None,
+            nats_scope: SubjectScope::from_env_or(
+                SubjectScope::new("local", "session-pty-router", "_")
+                    .expect("placeholder scope is statically valid"),
+            ),
         }
     }
 
     /// Create a new router with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(RouterConfig::default())
+    }
+
+    /// Attach a NATS client for session registration/deregistration events.
+    ///
+    /// After a PTY session is successfully launched the router publishes a
+    /// [`SessionRegistration`] envelope to
+    /// `agentos.v1.{ws}.{proj}.{tenant}.agents.{session_id}.register`.
+    /// When a session is killed the router publishes
+    /// `{ "session_id": "..." }` to
+    /// `agentos.v1.{ws}.{proj}.{tenant}.agents.{session_id}.deregister`.
+    /// If no client is attached these publishes are silently skipped.
+    pub fn with_nats(mut self, client: async_nats::Client) -> Self {
+        self.nats_client = Some(client);
+        self
+    }
+
+    /// Override the subject scope (test-only). Production callers rely on
+    /// the env-based scope set at construction.
+    #[doc(hidden)]
+    pub fn with_scope(mut self, scope: SubjectScope) -> Self {
+        self.nats_scope = scope;
+        self
     }
 
     // -- public API ---------------------------------------------------------
@@ -249,6 +286,9 @@ impl PtyRouter {
 
         let mut pty = NativePtySession::new();
         let id = *pty.id();
+
+        // Capture role label before cmd_type is moved into metadata.
+        let role_label = format!("{:?}", cmd_type).to_lowercase();
 
         // Spawn.
         let spawn_cfg = cmd_type.spawn_config(&working_dir);
@@ -287,6 +327,34 @@ impl PtyRouter {
 
         debug!(%id, %name, "session created in router");
 
+        // Publish session registration to NATS (best-effort; skip if no client).
+        // Subject: agentos.v1.{ws}.{proj}.{tenant}.agents.{session_id}.register
+        // Lands in JetStream stream AGENTOS_AGENTS (24h retention).
+        if let Some(ref nats) = self.nats_client {
+            let machine_id = std::env::var("HOSTNAME").unwrap_or_default();
+            let registration = SessionRegistration {
+                session_id: id.to_string(),
+                project_id: self.nats_scope.project_id.clone(),
+                identity: name.clone(),
+                role: role_label,
+                machine_id,
+                registered_at: Utc::now(),
+            };
+            if let Ok(payload) = serde_json::to_vec(&registration) {
+                let session_token = id.to_string();
+                match Subject::build(
+                    &self.nats_scope,
+                    Domain::Agents,
+                    [session_token.as_str(), "register"],
+                ) {
+                    Ok(subject) => {
+                        let _ = nats.publish(subject.to_string(), payload.into()).await;
+                    }
+                    Err(e) => warn!(error = %e, "failed to build agents.register subject"),
+                }
+            }
+        }
+
         // Start the output pump: continuously read from a dup'd master fd
         // and push OutputChunks to the broadcast channel.  The dup'd handle
         // is owned by the pump task, so no lock is held across the async read.
@@ -299,7 +367,9 @@ impl PtyRouter {
             let channels = {
                 let sessions_guard = self.sessions.read();
                 let rt = sessions_guard.get(&id).expect("just inserted");
-                let read_handle = rt.session.dup_read_handle()
+                let read_handle = rt
+                    .session
+                    .dup_read_handle()
                     .expect("dup master fd for output pump")
                     .expect("session was just spawned, master fd must exist");
                 (rt.tx.clone(), rt.tag_tx.clone(), read_handle)
@@ -405,36 +475,41 @@ impl PtyRouter {
             let mut sessions = self.sessions.write();
             sessions.insert(id, rt);
         }
-        write_result.map(|n| n).map_err(RouterError::Pty)
+        write_result.map_err(RouterError::Pty)
     }
 
     /// Resize the terminal of a named session.
-    #[allow(clippy::await_holding_lock)]
-    pub async fn resize(
-        &self,
-        name: &str,
-        cols: u16,
-        rows: u16,
-    ) -> RouterResult<()> {
+    ///
+    /// Uses the same remove-then-reinsert pattern as `send` so the
+    /// parking_lot write guard is never held across an `.await` point.
+    /// This keeps the returned future `Send`, which is required when
+    /// the caller lives in an axum WebSocket handler.
+    pub async fn resize(&self, name: &str, cols: u16, rows: u16) -> RouterResult<()> {
         let id = self.resolve_name(name)?;
-        let mut sessions = self.sessions.write();
-        let rt = sessions
-            .get_mut(&id)
-            .ok_or_else(|| RouterError::SessionNameNotFound(name.into()))?;
-        rt.session
+        let mut rt = {
+            let mut sessions = self.sessions.write();
+            sessions
+                .remove(&id)
+                .ok_or_else(|| RouterError::SessionNameNotFound(name.into()))?
+        };
+        // Lock is released. Perform the async resize (ioctl — never actually
+        // yields, but must be awaited per the trait contract).
+        let result = rt
+            .session
             .resize(cols, rows)
             .await
-            .map_err(RouterError::Pty)?;
-        Ok(())
+            .map_err(RouterError::Pty);
+        // Re-insert regardless of result to keep the session alive.
+        {
+            let mut sessions = self.sessions.write();
+            sessions.insert(id, rt);
+        }
+        result
     }
 
     /// Broadcast `instruction` to all named sessions.  Returns the list of
     /// session names that failed.
-    pub async fn broadcast(
-        &self,
-        names: &[String],
-        instruction: &[u8],
-    ) -> RouterResult<()> {
+    pub async fn broadcast(&self, names: &[String], instruction: &[u8]) -> RouterResult<()> {
         let mut failures = Vec::new();
         for name in names {
             if let Err(e) = self.send(name, instruction).await {
@@ -449,10 +524,7 @@ impl PtyRouter {
     }
 
     /// Subscribe to output from the named session.
-    pub fn subscribe(
-        &self,
-        name: &str,
-    ) -> RouterResult<broadcast::Receiver<OutputChunk>> {
+    pub fn subscribe(&self, name: &str) -> RouterResult<broadcast::Receiver<OutputChunk>> {
         let id = self.resolve_name(name)?;
         let sessions = self.sessions.read();
         let rt = sessions
@@ -468,10 +540,7 @@ impl PtyRouter {
     /// [`TagEvent`]s containing both the parsed tag and its wire
     /// [`TokenFrame`]. Downstream consumers (e.g. the NATS bridge) subscribe
     /// to this channel to publish only tag-originated frames.
-    pub fn subscribe_tags(
-        &self,
-        name: &str,
-    ) -> RouterResult<broadcast::Receiver<TagEvent>> {
+    pub fn subscribe_tags(&self, name: &str) -> RouterResult<broadcast::Receiver<TagEvent>> {
         let id = self.resolve_name(name)?;
         let sessions = self.sessions.read();
         let rt = sessions
@@ -568,6 +637,27 @@ impl PtyRouter {
             names.remove(name);
         }
         debug!(%id, name, "session killed via router");
+
+        // Publish session deregistration to NATS (best-effort; skip if no client).
+        // Subject: agentos.v1.{ws}.{proj}.{tenant}.agents.{session_id}.deregister
+        // Lands in JetStream stream AGENTOS_AGENTS (24h retention).
+        if let Some(ref nats) = self.nats_client {
+            let payload = serde_json::json!({ "session_id": id.to_string() });
+            if let Ok(bytes) = serde_json::to_vec(&payload) {
+                let session_token = id.to_string();
+                match Subject::build(
+                    &self.nats_scope,
+                    Domain::Agents,
+                    [session_token.as_str(), "deregister"],
+                ) {
+                    Ok(subject) => {
+                        let _ = nats.publish(subject.to_string(), bytes.into()).await;
+                    }
+                    Err(e) => warn!(error = %e, "failed to build agents.deregister subject"),
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -699,10 +789,14 @@ mod tests {
     async fn send_to_session() {
         let router = PtyRouter::with_defaults();
         router
-            .create_session("cat-test", CommandType::Custom {
-                command: "cat".into(),
-                args: vec![],
-            }, "/tmp")
+            .create_session(
+                "cat-test",
+                CommandType::Custom {
+                    command: "cat".into(),
+                    args: vec![],
+                },
+                "/tmp",
+            )
             .await
             .expect("create");
 
